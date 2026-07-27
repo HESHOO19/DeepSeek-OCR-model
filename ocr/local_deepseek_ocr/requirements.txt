@@ -1,0 +1,17 @@
+# Versions pinned per the official model card:
+# https://huggingface.co/deepseek-ai/DeepSeek-OCR
+torch==2.6.0
+transformers==4.46.3
+tokenizers==0.20.3
+einops
+addict
+easydict
+fastapi
+uvicorn[standard]
+bitsandbytes
+accelerate
+
+# Optional, big speedup, but painful to build on Windows without WSL.
+# The server falls back to eager attention automatically if this isn't
+# installed or fails to import, so it's safe to skip and add later.
+# flash-attn==2.7.3
