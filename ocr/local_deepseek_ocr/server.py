@@ -23,12 +23,15 @@ fix pattern used for the "model offline" bug in the DeepSeek-OCR GUI project.
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import logging
 import os
 import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import torch
 from fastapi import FastAPI
@@ -219,30 +222,43 @@ async def chat_completions(request: dict) -> JSONResponse:
         with open(image_path, "wb") as f:
             f.write(image_bytes)
 
-        result = _state["model"].infer(
-            _state["tokenizer"],
-            prompt=prompt,
-            image_file=image_path,
-            output_path=tmp_dir,
-            base_size=1024,
-            image_size=640,
-            crop_mode=True,
-            # False: this only controls DeepSeek-OCR's own internal debug dump
-            # (raw HTML printed to console + written to output_path, which is
-            # a TemporaryDirectory that's deleted right after this block ends
-            # anyway). The real, format-converted result is saved separately
-            # by OCRService.save_output() in ocr_service.py -> ocr/ocr_outputs/.
-            save_results=False,
-        )
+        # save_results MUST be True: on upstream DeepSeek-OCR, infer() only
+        # populates its return value when save_results=True (confirmed via
+        # https://github.com/deepseek-ai/DeepSeek-OCR/issues/249 -- without
+        # it, infer() effectively returns nothing usable). Setting it False
+        # to silence the console dump (as we tried before) breaks the actual
+        # OCR result, not just the noise -- that's what caused the empty
+        # json/md/txt outputs. So: keep it True, and suppress the console
+        # spam separately via redirect_stdout instead.
+        stdout_capture = io.StringIO()
+        with contextlib.redirect_stdout(stdout_capture):
+            result = _state["model"].infer(
+                _state["tokenizer"],
+                prompt=prompt,
+                image_file=image_path,
+                output_path=tmp_dir,
+                base_size=1024,
+                image_size=640,
+                crop_mode=True,
+                save_results=True,
+            )
 
-    # infer() returns a dict with a "text" key in current releases; fall back
-    # to stringifying whatever comes back if that shape ever changes.
-    if isinstance(result, dict):
-        text = result.get("text", "")
-    elif isinstance(result, str):
-        text = result
-    else:
-        text = str(result) if result is not None else ""
+        if isinstance(result, dict):
+            text = result.get("text", "")
+        elif isinstance(result, str):
+            text = result
+        else:
+            text = str(result) if result is not None else ""
+
+        # Fallback: some DeepSeek-OCR versions leave the return value empty
+        # even with save_results=True and only write the real text to disk.
+        # Must happen inside this `with` block -- tmp_dir is deleted on exit.
+        if not text.strip():
+            for pattern in ("*.mmd", "*.md", "*.txt"):
+                matches = sorted(Path(tmp_dir).rglob(pattern))
+                if matches:
+                    text = matches[0].read_text(encoding="utf-8", errors="ignore")
+                    break
 
     return JSONResponse(
         content={
