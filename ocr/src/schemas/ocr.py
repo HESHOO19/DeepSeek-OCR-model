@@ -25,6 +25,7 @@ class OutputFormat(str, Enum):
     JSON = "json"
     PLAIN_TEXT = "plain_text"
     EXCEL = "excel"
+    CSV = "csv"
 
 
 class OCRPageResult(BaseModel):

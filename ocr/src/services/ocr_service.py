@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import re
@@ -34,6 +35,7 @@ OUTPUT_EXTENSIONS = {
     OutputFormat.JSON: ".json",
     OutputFormat.PLAIN_TEXT: ".txt",
     OutputFormat.EXCEL: ".xlsx",
+    OutputFormat.CSV: ".csv",
 }
 
 _WRAPPING_FENCE_RE = re.compile(
@@ -124,7 +126,7 @@ class OCRService:
 
     @staticmethod
     def _format_instructions(output_format: OutputFormat) -> str:
-        if output_format == OutputFormat.EXCEL:
+        if output_format in (OutputFormat.EXCEL, OutputFormat.CSV):
             return """
 Return ONLY valid JSON that can be converted into Excel:
 - No Markdown fences, comments, prose before JSON, prose after JSON, or HTML/XML tags.
@@ -572,12 +574,27 @@ Dense document handling:
         raise ValueError("Model output did not contain valid JSON.")
 
     @classmethod
+    def _write_csv(cls, output_path: Path, tables: list[dict[str, Any]]) -> None:
+        if not tables:
+            tables = [{"title": "OCR Text", "rows": [["No extractable text"]]}]
+
+        with output_path.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.writer(fh)
+            multi_table = len(tables) > 1
+            for idx, table in enumerate(tables):
+                if multi_table:
+                    if idx > 0:
+                        writer.writerow([])
+                    writer.writerow([table.get("title") or f"Table {idx + 1}"])
+                for row in table.get("rows") or [[""]]:
+                    writer.writerow(row)
+
+    @classmethod
     def _normalize_output(cls, text: str, output_format: OutputFormat) -> str:
         text = text or ""
         tables = cls._extract_html_tables(text)
 
-        if output_format == OutputFormat.EXCEL:
-            export_tables = cls._tables_for_export(text)
+        if output_format in (OutputFormat.EXCEL, OutputFormat.CSV):
             if export_tables:
                 markdown_tables = [
                     cls._html_tables_to_markdown(
@@ -640,6 +657,8 @@ Dense document handling:
         output_path = OUTPUT_DIR / cls._safe_output_name(original_filename, output_format)
         if output_format == OutputFormat.EXCEL:
             cls._write_xlsx(output_path, cls._tables_for_export(text))
+        elif output_format == OutputFormat.CSV:
+            cls._write_csv(output_path, cls._tables_for_export(text))
         else:
             output_path.write_text(text, encoding="utf-8")
         logger.info("Saved OCR output to %s", output_path)
@@ -690,9 +709,9 @@ Dense document handling:
         if source_path.parent != output_dir or not source_path.exists() or not source_path.is_file():
             raise FileNotFoundError(f"Source output '{source_filename}' not found.")
 
-        if source_path.suffix.lower() == ".xlsx":
+        if source_path.suffix.lower() in (".xlsx", ".csv"):
             raise ValueError(
-                "Converting from an existing .xlsx file isn't supported. "
+                "Converting from an existing .xlsx or .csv file isn't supported. "
                 "Convert from the json, md, or txt output instead."
             )
 
@@ -704,6 +723,8 @@ Dense document handling:
 
         if target_format == OutputFormat.EXCEL:
             cls._write_xlsx(output_path, tables)
+        elif target_format == OutputFormat.CSV:
+            cls._write_csv(output_path, tables)
         elif target_format == OutputFormat.JSON:
             output_path.write_text(cls._tables_to_json(tables), encoding="utf-8")
         elif target_format == OutputFormat.PLAIN_TEXT:
