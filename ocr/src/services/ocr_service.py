@@ -645,6 +645,75 @@ Dense document handling:
         logger.info("Saved OCR output to %s", output_path)
         return str(output_path)
 
+    @classmethod
+    def _tables_to_plain_text(cls, tables: list[dict[str, Any]]) -> str:
+        return "\n\n".join(
+            "\n".join("\t".join(cell for cell in row).rstrip() for row in table.get("rows") or [])
+            for table in tables
+        )
+
+    @classmethod
+    def _tables_to_markdown(cls, tables: list[dict[str, Any]]) -> str:
+        blocks: list[str] = []
+        for table in tables:
+            rows = table.get("rows") or []
+            if not rows:
+                continue
+            width = len(rows[0])
+            header, body = rows[0], rows[1:] or [[""] * width]
+            all_rows = [header, ["---"] * width, *body]
+            blocks.append(
+                "\n".join(
+                    "| " + " | ".join(cell.replace("|", "\\|") for cell in row) + " |"
+                    for row in all_rows
+                )
+            )
+        return "\n\n".join(blocks)
+
+    @classmethod
+    def _tables_to_json(cls, tables: list[dict[str, Any]]) -> str:
+        return json.dumps({"tables": tables}, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def convert_output(cls, source_filename: str, target_format: OutputFormat) -> str:
+        """Convert an already-saved output file (json/md/txt/xlsx source text)
+        into any other output format, including Excel.
+
+        Works regardless of the source file's original format because
+        `_tables_for_export` already knows how to pull tabular data out of
+        HTML, JSON, Markdown, or plain text -- so the format that produced
+        the source file doesn't matter, only its content does.
+        """
+        output_dir = OUTPUT_DIR.resolve()
+        source_path = (output_dir / source_filename).resolve()
+
+        if source_path.parent != output_dir or not source_path.exists() or not source_path.is_file():
+            raise FileNotFoundError(f"Source output '{source_filename}' not found.")
+
+        if source_path.suffix.lower() == ".xlsx":
+            raise ValueError(
+                "Converting from an existing .xlsx file isn't supported. "
+                "Convert from the json, md, or txt output instead."
+            )
+
+        raw_text = source_path.read_text(encoding="utf-8")
+        tables = cls._tables_for_export(raw_text)
+
+        base_stem = re.sub(r"_ocr_\d{8}_\d{6}$", "", source_path.stem) or source_path.stem
+        output_path = OUTPUT_DIR / cls._safe_output_name(base_stem, target_format)
+
+        if target_format == OutputFormat.EXCEL:
+            cls._write_xlsx(output_path, tables)
+        elif target_format == OutputFormat.JSON:
+            output_path.write_text(cls._tables_to_json(tables), encoding="utf-8")
+        elif target_format == OutputFormat.PLAIN_TEXT:
+            output_path.write_text(cls._tables_to_plain_text(tables), encoding="utf-8")
+        else:
+            output_path.write_text(cls._tables_to_markdown(tables), encoding="utf-8")
+
+        logger.info("Converted %s -> %s", source_path.name, output_path)
+        return str(output_path)
+
     async def _ocr_single_image(
         self,
         image_bytes: bytes,

@@ -227,7 +227,12 @@ async def chat_completions(request: dict) -> JSONResponse:
             base_size=1024,
             image_size=640,
             crop_mode=True,
-            save_results=True,
+            # False: this only controls DeepSeek-OCR's own internal debug dump
+            # (raw HTML printed to console + written to output_path, which is
+            # a TemporaryDirectory that's deleted right after this block ends
+            # anyway). The real, format-converted result is saved separately
+            # by OCRService.save_output() in ocr_service.py -> ocr/ocr_outputs/.
+            save_results=False,
         )
 
     # infer() returns a dict with a "text" key in current releases; fall back

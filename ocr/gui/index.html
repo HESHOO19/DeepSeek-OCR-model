@@ -218,6 +218,16 @@
       </div>
       <pre class="output-text placeholder" id="outputText">- select a document and run OCR -</pre>
       <div class="meta-strip" id="metaStrip" hidden></div>
+      <div class="convert-row" id="convertRow" hidden style="display:flex; gap:8px; align-items:center; margin-top:10px;">
+        <span>Convert saved output to</span>
+        <select id="convertFormat">
+          <option value="excel" selected>Excel sheet</option>
+          <option value="markdown">Markdown</option>
+          <option value="json">JSON</option>
+          <option value="plain_text">Plain text</option>
+        </select>
+        <button id="convertBtn">Convert &amp; download</button>
+      </div>
     </section>
   </div>
 </div>
@@ -241,6 +251,9 @@ const statusDot = $('statusDot');
 const statusText = $('statusText');
 const statusMeta = $('statusMeta');
 const statusPill = $('statusPill');
+const convertRow = $('convertRow');
+const convertFormat = $('convertFormat');
+const convertBtn = $('convertBtn');
 
 let currentFile = null;
 let lastResultText = '';
@@ -248,6 +261,7 @@ let lastFilename = 'ocr_result';
 let lastExtension = 'md';
 let lastMime = 'text/markdown';
 let lastOutputUrl = '';
+let lastOutputFilename = '';
 
 function setDownloadFormat(format){
   const formats = {
@@ -378,7 +392,9 @@ submitBtn.addEventListener('click', async () => {
       lastResultText = data.text || '';
       lastFilename = (data.filename || 'ocr_result').replace(/\.[^/.]+$/, '');
       lastOutputUrl = data.output_url || '';
+      lastOutputFilename = lastOutputUrl ? lastOutputUrl.split('/').pop() : '';
       setDownloadFormat($('outputFormat').value);
+      convertRow.hidden = !lastOutputFilename;
 
       const meta = data.metadata || {};
       metaStrip.hidden = false;
@@ -423,6 +439,41 @@ downloadBtn.addEventListener('click', () => {
   a.download = `${lastFilename}_ocr.${lastExtension}`;
   a.click();
   URL.revokeObjectURL(url);
+});
+
+convertBtn.addEventListener('click', async () => {
+  if (!lastOutputFilename) return;
+
+  convertBtn.disabled = true;
+  const originalLabel = convertBtn.textContent;
+  convertBtn.textContent = 'Converting...';
+
+  try{
+    const res = await fetch('/convert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: lastOutputFilename,
+        target_format: convertFormat.value,
+      }),
+    });
+    const data = await res.json();
+
+    if (!res.ok){
+      alert(data.detail || 'Conversion failed.');
+      return;
+    }
+
+    const a = document.createElement('a');
+    a.href = data.output_url;
+    a.download = data.filename;
+    a.click();
+  }catch(e){
+    alert(`Could not reach the OCR backend. (${e.message})`);
+  }finally{
+    convertBtn.disabled = false;
+    convertBtn.textContent = originalLabel;
+  }
 });
 
 setDownloadFormat($('outputFormat').value);

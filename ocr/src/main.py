@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 from src.config import settings
 from src.schemas.ocr import OCRType, OutputFormat
@@ -50,6 +51,27 @@ async def download_output(filename: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="Output file not found.")
 
     return FileResponse(path=str(output_path), filename=output_path.name)
+
+
+class ConvertRequest(BaseModel):
+    filename: str
+    target_format: OutputFormat
+
+
+@app.post("/convert")
+async def convert_output(payload: ConvertRequest) -> dict:
+    """Convert an already-saved OCR output (json/md/txt) into any other
+    format, including Excel -- regardless of what format it was originally
+    saved as."""
+    try:
+        output_path = ocr_service.convert_output(payload.filename, payload.target_format)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    name = Path(output_path).name
+    return {"output_path": output_path, "output_url": f"/outputs/{name}", "filename": name}
 
 
 @app.post("/ocr")
