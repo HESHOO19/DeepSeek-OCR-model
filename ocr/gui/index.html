@@ -138,6 +138,47 @@
     display:flex;flex-wrap:wrap;gap:14px;font-size:11.5px;color:#5a6167;
   }
   .meta-strip b{color:var(--text-dim);font-weight:600}
+
+  .crop-tools{margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .crop-tools button{
+    background:transparent;border:1px solid var(--line);color:var(--text-dim);
+    font:inherit;font-size:12px;padding:6px 10px;border-radius:var(--radius);cursor:pointer;
+  }
+  .crop-tools button:hover{border-color:var(--accent);color:var(--text)}
+  .crop-badge{font-size:11.5px;color:var(--accent);font-weight:600;display:flex;align-items:center;gap:6px}
+  .crop-badge button{background:none;border:none;color:var(--text-dim);text-decoration:underline;cursor:pointer;font:inherit;padding:0;font-size:11.5px}
+
+  .crop-modal{
+    position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:50;
+    display:flex;align-items:center;justify-content:center;padding:20px;
+  }
+  .crop-modal-inner{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px;display:flex;flex-direction:column;gap:14px;max-width:94vw;
+  }
+  .crop-hint{margin:0;font-size:12px;color:var(--text-dim)}
+  .crop-stage{position:relative;overflow:hidden;touch-action:none;user-select:none;border:1px solid var(--line);background:#000}
+  .crop-stage-img{display:block;width:100%;height:100%;pointer-events:none;-webkit-user-drag:none}
+  .crop-box{
+    position:absolute;border:2px solid var(--accent);cursor:move;touch-action:none;
+    box-shadow:0 0 0 9999px rgba(0,0,0,.55);
+  }
+  .crop-handle{
+    position:absolute;width:14px;height:14px;background:var(--accent);
+    border:2px solid #ffffff;border-radius:2px;touch-action:none;
+  }
+  .crop-handle.nw{top:-8px;left:-8px;cursor:nwse-resize}
+  .crop-handle.ne{top:-8px;right:-8px;cursor:nesw-resize}
+  .crop-handle.sw{bottom:-8px;left:-8px;cursor:nesw-resize}
+  .crop-handle.se{bottom:-8px;right:-8px;cursor:nwse-resize}
+  .crop-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+  .crop-actions button{
+    background:transparent;border:1px solid var(--line);color:var(--text-dim);
+    font:inherit;font-size:12.5px;padding:9px 14px;border-radius:var(--radius);cursor:pointer;
+  }
+  .crop-actions button:hover{border-color:var(--accent);color:var(--text)}
+  .crop-actions button.run-btn{background:var(--accent);color:var(--accent-fg);border:none;font-weight:700}
+  .crop-actions button.run-btn:hover{opacity:.92;color:var(--accent-fg)}
 </style>
 </head>
 <body>
@@ -172,6 +213,31 @@
         <div class="scan-line" id="scanLine" hidden></div>
       </div>
       <div class="filemeta" id="fileMeta" hidden></div>
+
+      <div class="crop-tools" id="cropTools" hidden>
+        <button type="button" id="cropOpenBtn">Crop image</button>
+        <span class="crop-badge" id="cropBadge" hidden>Cropped <button type="button" id="cropUndoBtn">undo</button></span>
+      </div>
+
+      <div class="crop-modal" id="cropModal" hidden>
+        <div class="crop-modal-inner">
+          <p class="crop-hint">Drag inside the box to move it, drag a corner to resize. This crop is applied before the document is sent for OCR.</p>
+          <div class="crop-stage" id="cropStage">
+            <img class="crop-stage-img" id="cropStageImg" alt="crop selection">
+            <div class="crop-box" id="cropBox">
+              <div class="crop-handle nw" data-handle="nw"></div>
+              <div class="crop-handle ne" data-handle="ne"></div>
+              <div class="crop-handle sw" data-handle="sw"></div>
+              <div class="crop-handle se" data-handle="se"></div>
+            </div>
+          </div>
+          <div class="crop-actions">
+            <button type="button" id="cropResetBtn">Reset selection</button>
+            <button type="button" id="cropCancelBtn">Cancel</button>
+            <button type="button" id="cropApplyBtn" class="run-btn">Apply crop</button>
+          </div>
+        </div>
+      </div>
 
       <div class="controls">
         <label class="field">
@@ -262,6 +328,24 @@ const convertRow = $('convertRow');
 const convertFormat = $('convertFormat');
 const convertBtn = $('convertBtn');
 
+const cropTools = $('cropTools');
+const cropOpenBtn = $('cropOpenBtn');
+const cropBadge = $('cropBadge');
+const cropUndoBtn = $('cropUndoBtn');
+const cropModal = $('cropModal');
+const cropStage = $('cropStage');
+const cropStageImg = $('cropStageImg');
+const cropBox = $('cropBox');
+const cropResetBtn = $('cropResetBtn');
+const cropCancelBtn = $('cropCancelBtn');
+const cropApplyBtn = $('cropApplyBtn');
+
+let originalFile = null;
+let isCropped = false;
+let cropDrag = null;
+let cropStageSize = { width: 0, height: 0 };
+let cropBoxRect = { x: 0, y: 0, w: 0, h: 0 };
+
 let currentFile = null;
 let lastResultText = '';
 let lastFilename = 'ocr_result';
@@ -310,13 +394,18 @@ function humanSize(bytes){
 
 function setFile(file){
   if (!file) return;
+  originalFile = file;
   currentFile = file;
+  isCropped = false;
   submitBtn.disabled = false;
 
   const isImage = file.type.startsWith('image/');
   dropContent.hidden = true;
   fileMeta.hidden = false;
   fileMeta.innerHTML = `<span title="${file.name}">${file.name}</span><span>${humanSize(file.size)}</span>`;
+
+  cropTools.hidden = !isImage;
+  cropBadge.hidden = true;
 
   if (isImage){
     previewImg.src = URL.createObjectURL(file);
@@ -328,6 +417,146 @@ function setFile(file){
     filePill.innerHTML = `<span class="ext">PDF</span><span>${file.name}</span>`;
   }
 }
+
+function refreshFileMetaDisplay(file){
+  fileMeta.innerHTML = `<span title="${file.name}">${file.name}</span><span>${humanSize(file.size)}</span>`;
+  previewImg.src = URL.createObjectURL(file);
+}
+
+function renderCropBox(){
+  cropBox.style.left = cropBoxRect.x + 'px';
+  cropBox.style.top = cropBoxRect.y + 'px';
+  cropBox.style.width = cropBoxRect.w + 'px';
+  cropBox.style.height = cropBoxRect.h + 'px';
+}
+
+function clampCropBox(){
+  const min = 24;
+  cropBoxRect.w = Math.max(min, Math.min(cropBoxRect.w, cropStageSize.width));
+  cropBoxRect.h = Math.max(min, Math.min(cropBoxRect.h, cropStageSize.height));
+  cropBoxRect.x = Math.max(0, Math.min(cropBoxRect.x, cropStageSize.width - cropBoxRect.w));
+  cropBoxRect.y = Math.max(0, Math.min(cropBoxRect.y, cropStageSize.height - cropBoxRect.h));
+}
+
+function defaultCropBox(){
+  const bw = cropStageSize.width * 0.8;
+  const bh = cropStageSize.height * 0.8;
+  cropBoxRect = { x: (cropStageSize.width - bw) / 2, y: (cropStageSize.height - bh) / 2, w: bw, h: bh };
+}
+
+function openCropModal(){
+  if (!currentFile) return;
+  const objectUrl = URL.createObjectURL(currentFile);
+
+  cropStageImg.onload = () => {
+    const maxW = Math.min(window.innerWidth * 0.82, 760);
+    const maxH = Math.min(window.innerHeight * 0.6, 560);
+    const ratio = Math.min(maxW / cropStageImg.naturalWidth, maxH / cropStageImg.naturalHeight, 1) || 1;
+
+    cropStageSize = {
+      width: Math.round(cropStageImg.naturalWidth * ratio),
+      height: Math.round(cropStageImg.naturalHeight * ratio),
+    };
+    cropStage.style.width = cropStageSize.width + 'px';
+    cropStage.style.height = cropStageSize.height + 'px';
+
+    defaultCropBox();
+    renderCropBox();
+    cropModal.hidden = false;
+  };
+  cropStageImg.src = objectUrl;
+}
+
+function closeCropModal(){
+  cropModal.hidden = true;
+  cropDrag = null;
+}
+
+cropOpenBtn.addEventListener('click', openCropModal);
+cropCancelBtn.addEventListener('click', closeCropModal);
+cropResetBtn.addEventListener('click', () => { defaultCropBox(); renderCropBox(); });
+
+cropModal.addEventListener('click', (e) => {
+  if (e.target === cropModal) closeCropModal();
+});
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !cropModal.hidden) closeCropModal();
+});
+
+cropBox.addEventListener('pointerdown', (e) => {
+  cropDrag = {
+    handle: e.target.dataset.handle || null,
+    startX: e.clientX,
+    startY: e.clientY,
+    box: { ...cropBoxRect },
+  };
+  e.preventDefault();
+});
+
+window.addEventListener('pointermove', (e) => {
+  if (!cropDrag) return;
+  const dx = e.clientX - cropDrag.startX;
+  const dy = e.clientY - cropDrag.startY;
+  const box = cropDrag.box;
+
+  if (!cropDrag.handle){
+    cropBoxRect = { ...box, x: box.x + dx, y: box.y + dy };
+  } else {
+    let { x, y, w, h } = box;
+    if (cropDrag.handle.includes('n')){ y = box.y + dy; h = box.h - dy; }
+    if (cropDrag.handle.includes('s')){ h = box.h + dy; }
+    if (cropDrag.handle.includes('w')){ x = box.x + dx; w = box.w - dx; }
+    if (cropDrag.handle.includes('e')){ w = box.w + dx; }
+    cropBoxRect = { x, y, w, h };
+  }
+  clampCropBox();
+  renderCropBox();
+});
+
+window.addEventListener('pointerup', () => { cropDrag = null; });
+
+cropApplyBtn.addEventListener('click', () => {
+  const scaleX = cropStageImg.naturalWidth / cropStageSize.width;
+  const scaleY = cropStageImg.naturalHeight / cropStageSize.height;
+  const sx = Math.round(cropBoxRect.x * scaleX);
+  const sy = Math.round(cropBoxRect.y * scaleY);
+  const sw = Math.max(1, Math.round(cropBoxRect.w * scaleX));
+  const sh = Math.max(1, Math.round(cropBoxRect.h * scaleY));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = sw;
+  canvas.height = sh;
+  canvas.getContext('2d').drawImage(cropStageImg, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  const mime = (originalFile && originalFile.type && originalFile.type.startsWith('image/'))
+    ? originalFile.type
+    : 'image/png';
+
+  canvas.toBlob((blob) => {
+    if (!blob){
+      alert('Crop failed - could not read image data.');
+      return;
+    }
+    const baseName = (originalFile.name || 'image').replace(/\.[^/.]+$/, '');
+    const ext = mime === 'image/jpeg' ? 'jpg' : (mime.split('/')[1] || 'png');
+    currentFile = new File([blob], `${baseName}_cropped.${ext}`, { type: mime });
+    isCropped = true;
+
+    refreshFileMetaDisplay(currentFile);
+    cropBadge.hidden = false;
+    closeCropModal();
+  }, mime, 0.95);
+});
+
+cropUndoBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (!originalFile) return;
+  currentFile = originalFile;
+  isCropped = false;
+  cropBadge.hidden = true;
+  refreshFileMetaDisplay(originalFile);
+});
 
 dropzone.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', (e) => setFile(e.target.files[0]));
