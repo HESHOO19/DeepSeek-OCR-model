@@ -46,22 +46,46 @@ _FENCE_LINE_RE = re.compile(r"^\s*```[A-Za-z0-9_-]*\s*$", re.MULTILINE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
+_GROUNDING_TAG_RE = re.compile(r"<\|[^|>]*\|>(?:<\|det\|>.*?<\|/det\|>)?", re.DOTALL)
+
+
 class _HTMLTableParser(HTMLParser):
-    """Small stdlib HTML table parser for model outputs."""
+    """Parses model output into an ordered sequence of text and table
+    blocks, preserving the original document order.
+
+    This is what makes 'extract text and tables together, in page order'
+    actually possible: earlier versions only collected tables and threw
+    away everything else, so any paragraph/heading text before, between,
+    or after a table was silently dropped from every output format.
+    """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
+        self.blocks: list[dict[str, Any]] = []
+        # Kept for backward compatibility with callers that only want tables.
         self.tables: list[list[list[dict[str, Any]]]] = []
         self._table_stack: list[list[list[dict[str, Any]]]] = []
         self._current_row: list[dict[str, Any]] | None = None
         self._current_cell: dict[str, Any] | None = None
         self._cell_chunks: list[str] = []
+        self._text_chunks: list[str] = []
+
+    def _flush_text(self) -> None:
+        raw = "".join(self._text_chunks)
+        self._text_chunks = []
+        cleaned = _GROUNDING_TAG_RE.sub("", raw)
+        cleaned = unescape(cleaned).strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        if cleaned:
+            self.blocks.append({"type": "text", "content": cleaned})
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         attrs_dict = dict(attrs)
 
         if tag == "table":
+            if not self._table_stack:
+                self._flush_text()
             self._table_stack.append([])
         elif tag == "tr" and self._table_stack:
             self._current_row = []
@@ -73,8 +97,11 @@ class _HTMLTableParser(HTMLParser):
                 "colspan": self._positive_int(attrs_dict.get("colspan"), 1),
                 "rowspan": self._positive_int(attrs_dict.get("rowspan"), 1),
             }
-        elif tag == "br" and self._current_cell is not None:
-            self._cell_chunks.append("\n")
+        elif tag == "br":
+            if self._current_cell is not None:
+                self._cell_chunks.append("\n")
+            elif not self._table_stack:
+                self._text_chunks.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -83,6 +110,8 @@ class _HTMLTableParser(HTMLParser):
             table = self._table_stack.pop()
             if table:
                 self.tables.append(table)
+                if not self._table_stack:
+                    self.blocks.append({"type": "table", "rows": table})
         elif tag == "tr" and self._table_stack and self._current_row is not None:
             self._table_stack[-1].append(self._current_row)
             self._current_row = None
@@ -96,6 +125,8 @@ class _HTMLTableParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._current_cell is not None:
             self._cell_chunks.append(data)
+        elif not self._table_stack:
+            self._text_chunks.append(data)
 
     def close(self) -> None:
         super().close()
@@ -108,6 +139,11 @@ class _HTMLTableParser(HTMLParser):
             table = self._table_stack.pop()
             if table:
                 self.tables.append(table)
+                if not self._table_stack:
+                    self.blocks.append({"type": "table", "rows": table})
+
+        if not self._table_stack:
+            self._flush_text()
 
     @staticmethod
     def _positive_int(value: str | None, default: int) -> int:
@@ -258,6 +294,22 @@ Dense document handling:
         parser.feed(text)
         parser.close()
         return parser.tables
+
+    @staticmethod
+    def _extract_ordered_blocks(text: str) -> list[dict[str, Any]]:
+        """Return text and tables together, in the order they actually
+        appear in the model output -- this is what lets every output
+        format extract text and tables as they occur on the page instead
+        of grouping all tables together and dropping surrounding text."""
+        if "<table" not in text.lower():
+            cleaned = _GROUNDING_TAG_RE.sub("", text)
+            cleaned = unescape(cleaned).strip()
+            return [{"type": "text", "content": cleaned}] if cleaned else []
+
+        parser = _HTMLTableParser()
+        parser.feed(text)
+        parser.close()
+        return parser.blocks
 
     _NUMERIC_CELL_RE = re.compile(r"^[+-]?\d[\d,]*(\.\d+)?%?$")
 
@@ -449,6 +501,34 @@ Dense document handling:
 
     @classmethod
     def _json_tables_to_rows(cls, parsed: Any) -> list[dict[str, Any]]:
+        if isinstance(parsed, dict) and isinstance(parsed.get("blocks"), list):
+            tables: list[dict[str, Any]] = []
+            table_num = 0
+            for block in parsed["blocks"]:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "table":
+                    table_num += 1
+                    headers = block.get("headers") or []
+                    body_rows = block.get("rows") or []
+                    rows = [headers, *body_rows] if headers else body_rows
+                    normalized_rows = [
+                        [cls._cell_text(value) for value in row]
+                        for row in rows
+                        if isinstance(row, list)
+                    ]
+                    if normalized_rows:
+                        tables.append(
+                            {"title": block.get("title") or f"Table {table_num}", "rows": normalized_rows}
+                        )
+                elif block.get("type") == "text":
+                    content = str(block.get("content", "")).strip()
+                    if content:
+                        text_rows = [[line] for line in content.splitlines() if line.strip()]
+                        if text_rows:
+                            tables.append({"title": "Text", "rows": text_rows})
+            return tables
+
         if isinstance(parsed, list):
             if all(isinstance(row, list) for row in parsed):
                 return [{"title": "Table 1", "rows": parsed}]
@@ -501,23 +581,34 @@ Dense document handling:
     def _markdown_tables_to_rows(cls, text: str) -> list[dict[str, Any]]:
         tables: list[dict[str, Any]] = []
         current: list[list[str]] = []
+        text_lines: list[str] = []
 
-        def flush() -> None:
+        def flush_table() -> None:
             nonlocal current
             if current:
                 tables.append({"title": f"Table {len(tables) + 1}", "rows": current})
                 current = []
 
+        def flush_text() -> None:
+            nonlocal text_lines
+            if text_lines:
+                tables.append({"title": "Text", "rows": [[line] for line in text_lines]})
+                text_lines = []
+
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("|") and stripped.endswith("|"):
+                flush_text()
                 cells = [cell.strip().replace("\\|", "|") for cell in stripped.strip("|").split("|")]
                 if cells and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
                     continue
                 current.append(cells)
             else:
-                flush()
-        flush()
+                flush_table()
+                if stripped:
+                    text_lines.append(stripped)
+        flush_table()
+        flush_text()
         return tables
 
     @classmethod
@@ -531,13 +622,33 @@ Dense document handling:
         return [{"title": "OCR Text", "rows": rows}] if rows else []
 
     @classmethod
+    def _blocks_to_export_tables(cls, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Flatten ordered text/table blocks into a list of {title, rows}
+        tables, in the same order they occurred. Text blocks become a
+        single-column pseudo-table so table-shaped formats (Excel/CSV)
+        still carry surrounding text instead of dropping it."""
+        export_tables: list[dict[str, Any]] = []
+        table_num = 0
+        for block in blocks:
+            if block["type"] == "table":
+                table_num += 1
+                rows = cls._expanded_table_rows(block["rows"])
+                if rows:
+                    export_tables.append({"title": f"Table {table_num}", "rows": rows})
+            else:
+                content = str(block.get("content", "")).strip()
+                text_rows = [[line] for line in content.splitlines() if line.strip()]
+                if text_rows:
+                    export_tables.append({"title": "Text", "rows": text_rows})
+        return export_tables
+
+    @classmethod
     def _tables_for_export(cls, text: str) -> list[dict[str, Any]]:
-        html_tables = cls._extract_html_tables(text)
-        if html_tables:
-            return [
-                {"title": f"Table {idx}", "rows": cls._expanded_table_rows(table)}
-                for idx, table in enumerate(html_tables, start=1)
-            ]
+        blocks = cls._extract_ordered_blocks(text) if "<table" in text.lower() else []
+        if blocks:
+            export_tables = cls._blocks_to_export_tables(blocks)
+            if export_tables:
+                return export_tables
 
         try:
             json_tables = cls._json_tables_to_rows(cls._parse_json_from_text(text))
@@ -724,61 +835,98 @@ Dense document handling:
                     writer.writerow(row)
 
     @classmethod
+    def _blocks_to_markdown(cls, blocks: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for block in blocks:
+            if block["type"] == "table":
+                rendered = cls._html_tables_to_markdown([block["rows"]])
+                if rendered:
+                    parts.append(rendered)
+            else:
+                content = str(block.get("content", "")).strip()
+                if content:
+                    parts.append(content)
+        return "\n\n".join(parts)
+
+    @classmethod
+    def _blocks_to_plain_text(cls, blocks: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for block in blocks:
+            if block["type"] == "table":
+                rendered = cls._html_tables_to_plain_text([block["rows"]])
+                if rendered:
+                    parts.append(rendered)
+            else:
+                content = str(block.get("content", "")).strip()
+                if content:
+                    parts.append(content)
+        return "\n\n".join(parts)
+
+    @classmethod
+    def _export_tables_to_json_blocks(cls, export_tables: list[dict[str, Any]]) -> dict[str, Any]:
+        json_blocks: list[dict[str, Any]] = []
+        table_num = 0
+        for table in export_tables:
+            rows = table.get("rows") or []
+            if table.get("title") == "Text" and rows and all(len(row) == 1 for row in rows):
+                content = "\n".join(row[0] for row in rows)
+                if content.strip():
+                    json_blocks.append({"type": "text", "content": content})
+                continue
+            table_num += 1
+            json_blocks.append(
+                {
+                    "type": "table",
+                    "title": table.get("title") or f"Table {table_num}",
+                    "headers": rows[0] if rows else [],
+                    "rows": rows[1:] if len(rows) > 1 else [],
+                }
+            )
+        return {"blocks": json_blocks}
+
+    @classmethod
+    def _export_tables_to_markdown(cls, export_tables: list[dict[str, Any]]) -> str:
+        rendered = [
+            cls._html_tables_to_markdown(
+                [[[{"text": cell, "colspan": 1, "rowspan": 1} for cell in row] for row in table["rows"]]]
+            )
+            for table in export_tables
+        ]
+        return "\n\n".join(part for part in rendered if part)
+
+    @classmethod
     def _normalize_output(cls, text: str, output_format: OutputFormat) -> str:
         text = text or ""
-        tables = cls._extract_html_tables(text)
 
         if output_format in (OutputFormat.EXCEL, OutputFormat.CSV):
+            # Rendered as markdown pipe tables (including single-column
+            # "Text" pseudo-tables for surrounding prose) purely so this
+            # round-trips losslessly when save_output()/convert_output()
+            # later re-derive the actual xlsx/csv tables from this exact
+            # string via _tables_for_export() -- table-shaped text avoids
+            # any ambiguity a plain-prose rendering could introduce there.
             export_tables = cls._tables_for_export(text)
             if export_tables:
-                markdown_tables = [
-                    cls._html_tables_to_markdown(
-                        [
-                            [
-                                [{"text": cell, "colspan": 1, "rowspan": 1} for cell in row]
-                                for row in table["rows"]
-                            ]
-                        ]
-                    )
-                    for table in export_tables
-                ]
-                return "\n\n".join(markdown_tables)
+                return cls._export_tables_to_markdown(export_tables)
             return cls._strip_html_tags(cls._strip_fence_lines(text))
 
         if output_format == OutputFormat.JSON:
-            if tables:
-                export_tables = cls._tables_for_export(text)
-                parsed = {
-                    "tables": [
-                        {
-                            "title": table.get("title"),
-                            "headers": (table.get("rows") or [[]])[0],
-                            "rows": (table.get("rows") or [[]])[1:],
-                        }
-                        for table in export_tables
-                    ]
-                }
-            else:
-                try:
-                    parsed = cls._parse_json_from_text(text)
-                    if not isinstance(parsed, dict):
-                        parsed = {"items": parsed}
-                except ValueError:
-                    parsed = {
-                        "text": cls._strip_html_tags(cls._strip_fence_lines(text)),
-                        "warning": "model_output_was_not_valid_json",
-                    }
-            return json.dumps(parsed, ensure_ascii=False, indent=2)
+            export_tables = cls._tables_for_export(text)
+            if export_tables:
+                return json.dumps(
+                    cls._export_tables_to_json_blocks(export_tables), ensure_ascii=False, indent=2
+                )
+            return json.dumps({"blocks": []}, ensure_ascii=False, indent=2)
+
+        blocks = cls._extract_ordered_blocks(text)
+        if not blocks:
+            fallback = cls._strip_html_tags(cls._strip_fence_lines(text))
+            return fallback
 
         if output_format == OutputFormat.PLAIN_TEXT:
-            if tables:
-                return cls._html_tables_to_plain_text(tables)
-            return cls._strip_fence_lines(cls._strip_wrapping_fence(text))
+            return cls._blocks_to_plain_text(blocks)
 
-        if tables:
-            return cls._html_tables_to_markdown(tables)
-
-        return cls._strip_wrapping_fence(text).strip()
+        return cls._blocks_to_markdown(blocks)
 
     @staticmethod
     def _safe_output_name(original_filename: str, output_format: OutputFormat) -> str:
