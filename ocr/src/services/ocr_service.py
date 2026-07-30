@@ -165,26 +165,48 @@ Return ONLY Markdown:
 
     @classmethod
     def _build_prompt(cls, ocr_type: OCRType, output_format: OutputFormat) -> str:
-        base = """You are an expert OCR engine.
+        base = """You are an expert OCR engine performing precision document extraction.
 
 Extract every visible text element from the image with maximum fidelity.
 Preserve the original spelling, punctuation, capitalization, numbers, dates,
-codes, symbols, and reading order. Do not summarize. Do not translate.
-If a character or word is unclear, mark it as [uncertain] and keep going.
-If no text is visible, return an empty result in the requested format."""
+codes, symbols, and exact reading/page order -- top to bottom, left to
+right, following the document's real visual layout. Do not summarize,
+paraphrase, round numbers, or translate. Never invent, infer, or complete
+missing values -- if a character or word is unclear, mark it as [uncertain]
+and keep going; if a cell or field is genuinely blank in the source, leave
+it blank rather than guessing. When a page mixes paragraphs, headings, and
+tables, extract all of them in the single order they actually appear on
+the page -- do not group all tables together or move text before/after
+its true position."""
 
         type_instructions: dict[OCRType, str] = {
             OCRType.GENERAL: """
 Document handling:
 - Read headers, body text, captions, stamps, labels, signatures, and footers.
 - Keep related lines together and separate unrelated text blocks.
-- Preserve useful spacing where it affects meaning.""",
+- Preserve useful spacing where it affects meaning.
+- If the page also contains tables, extract them in place, at the exact
+  point they occur in the reading order -- do not separate text and
+  tables into different sections.""",
             OCRType.TABLE: """
-Table handling:
-- Detect every table and preserve row/column structure.
-- Include table titles, headers, merged-cell text, totals, notes, and footnotes.
-- Keep blank cells empty instead of shifting values across columns.
-- For Markdown output, every table row must have the same number of cells.""",
+Table handling -- extract with 100% precision, matching the source exactly:
+- Detect every table and preserve its exact row/column structure, including
+  merged cells (colspan/rowspan). Do not flatten, reorder, or simplify.
+- Multi-level headers: when a table has a parent/group header spanning
+  several inner sub-columns (a "common column" shared by multiple inner
+  columns), keep every level. Each leaf sub-column must carry its own
+  sub-header AND the group header(s) above it, so its full hierarchical
+  title is recoverable -- never drop the group header once you've read the
+  first sub-column under it.
+- Include table titles, headers, merged-cell text, totals, notes, and
+  footnotes exactly as printed.
+- Keep blank cells empty instead of shifting values across columns --
+  column alignment must exactly match the source, cell for cell.
+- Do not average, estimate, or normalize numeric values; copy digits and
+  units exactly as printed (including trailing zeros, units like "mm",
+  and separators like "," or ".").
+- For Markdown output, every row in a given table must have the same
+  number of cells as its header row.""",
             OCRType.FORM: """
 Form handling:
 - Extract labels with their corresponding values.
@@ -202,7 +224,9 @@ Dense document handling:
 - Process the page systematically by visible reading order.
 - Preserve columns as separate blocks.
 - Capture small print, footnotes, page numbers, stamps, and annotations.
-- Do not merge unrelated sections.""",
+- Do not merge unrelated sections.
+- If tables appear among dense text, extract them in place with full
+  structural precision, same as OCRType.TABLE handling.""",
         }
 
         return "\n\n".join(
@@ -235,19 +259,129 @@ Dense document handling:
         parser.close()
         return parser.tables
 
+    _NUMERIC_CELL_RE = re.compile(r"^[+-]?\d[\d,]*(\.\d+)?%?$")
+
     @staticmethod
     def _expanded_table_rows(table: list[list[dict[str, Any]]]) -> list[list[str]]:
-        rows: list[list[str]] = []
+        """Expand an HTML table into a full rectangular grid of plain
+        strings, correctly accounting for both colspan AND rowspan.
+
+        Cells covered by colspan/rowspan are omitted from a row's own <td>
+        list per the HTML table spec (rowspan cells especially "carry
+        down" into later rows with no <td> of their own) -- the previous
+        version of this function only accounted for colspan, so any table
+        using rowspan (common for multi-level headers, e.g. a "Size"
+        column header that spans two header rows) silently misaligned
+        every column after it.
+
+        Merged-cell text is duplicated into every cell it visually spans
+        (not just the top-left one) rather than left blank, so a header
+        like "Gland Dimensions" spanning 6 sub-columns keeps that context
+        on all 6, not just the first -- this is what lets
+        _merge_multirow_header build a full per-column title afterward.
+        """
+        grid: list[list[str]] = []
+        # col_index -> (text, rows_remaining) for cells still being carried
+        # down from an earlier row's rowspan.
+        pending: dict[int, tuple[str, int]] = {}
+
         for row in table:
             expanded_row: list[str] = []
-            for cell in row:
-                colspan = max(1, int(cell.get("colspan", 1)))
-                expanded_row.append(str(cell.get("text", "")))
-                expanded_row.extend([""] * (colspan - 1))
-            rows.append(expanded_row)
+            col_idx = 0
+            cell_iter = iter(row)
+            cell = next(cell_iter, None)
 
-        width = max((len(row) for row in rows), default=0)
-        return [row + [""] * (width - len(row)) for row in rows]
+            while cell is not None or col_idx in pending:
+                if col_idx in pending:
+                    text, remaining = pending[col_idx]
+                    expanded_row.append(text)
+                    remaining -= 1
+                    if remaining <= 0:
+                        del pending[col_idx]
+                    else:
+                        pending[col_idx] = (text, remaining)
+                    col_idx += 1
+                    continue
+
+                colspan = max(1, int(cell.get("colspan", 1)))
+                rowspan = max(1, int(cell.get("rowspan", 1)))
+                text = str(cell.get("text", ""))
+                for offset in range(colspan):
+                    expanded_row.append(text)
+                    if rowspan > 1:
+                        pending[col_idx + offset] = (text, rowspan - 1)
+                col_idx += colspan
+                cell = next(cell_iter, None)
+
+            grid.append(expanded_row)
+
+        width = max((len(row) for row in grid), default=0)
+        grid = [row + [""] * (width - len(row)) for row in grid]
+        has_span_structure = any(
+            max(1, int(cell.get("colspan", 1))) > 1 or max(1, int(cell.get("rowspan", 1))) > 1
+            for row in table[: min(4, len(table))]
+            for cell in row
+        )
+        return OCRService._merge_multirow_header(grid, has_span_structure)
+
+    @classmethod
+    def _looks_like_header_row(cls, row: list[str]) -> bool:
+        non_empty = [cell for cell in row if cell.strip()]
+        if not non_empty:
+            return True  # blank spacer row inside a header block
+        numeric = sum(1 for cell in non_empty if cls._NUMERIC_CELL_RE.match(cell.strip()))
+        return (numeric / len(non_empty)) < 0.5
+
+    @classmethod
+    def _merge_multirow_header(
+        cls, rows: list[list[str]], has_span_structure: bool
+    ) -> list[list[str]]:
+        """Collapse a multi-row header block (parent header + sub-column
+        headers) into a single composite header row, so every leaf column
+        keeps its full hierarchy, e.g. "Gland Dimensions - Hexagon Size
+        Across flat" instead of just the bottom-most, ambiguous label.
+
+        Gated on `has_span_structure` (whether the source table actually
+        used colspan/rowspan near the top) before even attempting
+        content-based header detection -- this is deliberate: guessing
+        "header-like" purely from cell content (mostly non-numeric text)
+        produces false positives on completely ordinary tables whose data
+        rows just happen to be text-heavy (e.g. Name/Age/City), merging
+        the real header into the first data row. Requiring actual span
+        structure first means this only ever fires on tables that are
+        genuinely nested.
+        """
+        if not has_span_structure or len(rows) < 3:
+            return rows
+
+        header_row_count = 0
+        for row in rows[:-1]:
+            if cls._looks_like_header_row(row):
+                header_row_count += 1
+            else:
+                break
+
+        if header_row_count < 2:
+            return rows
+
+        header_block = rows[:header_row_count]
+        data_rows = rows[header_row_count:]
+        width = len(header_block[0]) if header_block else 0
+
+        composite_header: list[str] = []
+        for col in range(width):
+            parts: list[str] = []
+            seen: set[str] = set()
+            for row in header_block:
+                if col >= len(row):
+                    continue
+                text = row[col].strip()
+                if text and text not in seen:
+                    parts.append(text)
+                    seen.add(text)
+            composite_header.append(" - ".join(parts))
+
+        return [composite_header, *data_rows]
 
     @classmethod
     def _html_tables_to_json(cls, tables: list[list[list[dict[str, Any]]]]) -> dict[str, Any]:
@@ -595,6 +729,7 @@ Dense document handling:
         tables = cls._extract_html_tables(text)
 
         if output_format in (OutputFormat.EXCEL, OutputFormat.CSV):
+            export_tables = cls._tables_for_export(text)
             if export_tables:
                 markdown_tables = [
                     cls._html_tables_to_markdown(
@@ -612,7 +747,17 @@ Dense document handling:
 
         if output_format == OutputFormat.JSON:
             if tables:
-                parsed = cls._html_tables_to_json(tables)
+                export_tables = cls._tables_for_export(text)
+                parsed = {
+                    "tables": [
+                        {
+                            "title": table.get("title"),
+                            "headers": (table.get("rows") or [[]])[0],
+                            "rows": (table.get("rows") or [[]])[1:],
+                        }
+                        for table in export_tables
+                    ]
+                }
             else:
                 try:
                     parsed = cls._parse_json_from_text(text)

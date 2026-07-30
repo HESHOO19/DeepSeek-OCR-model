@@ -42,6 +42,22 @@ logger = logging.getLogger(__name__)
 
 MODEL_NAME = "deepseek-ai/DeepSeek-OCR"
 
+# Resolution/crop tuning for extraction precision. Higher base_size relative
+# to image_size means the image is sampled into more, finer crops before
+# each patch goes through the vision encoder -- this is what actually
+# recovers small print inside dense tables. crop_mode=True is required for
+# this (DeepSeek-OCR's dynamic-resolution "Gundam" mode). Configurable via
+# env vars so precision can be traded against VRAM/speed without a code
+# change; defaults are pushed up from the stock 1024/640 preset for
+# tables-heavy documents.
+DEEPSEEK_BASE_SIZE = int(os.environ.get("DEEPSEEK_BASE_SIZE", "1280"))
+DEEPSEEK_IMAGE_SIZE = int(os.environ.get("DEEPSEEK_IMAGE_SIZE", "640"))
+DEEPSEEK_CROP_MODE = os.environ.get("DEEPSEEK_CROP_MODE", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
 app = FastAPI(title="DeepSeek-OCR Local Server")
 
 _state: dict = {"status": "loading", "model": None, "tokenizer": None, "error": None}
@@ -191,13 +207,21 @@ def _extract_prompt_and_image(messages: list) -> tuple[str, str | None]:
 
 
 def _build_deepseek_prompt(instruction_text: str) -> str:
-    """Map the caller's free-text instruction onto DeepSeek-OCR's expected
-    prompt tokens. Table/structured requests get the grounding+markdown
-    prompt; everything else gets plain Free OCR."""
-    lowered = instruction_text.lower()
-    if "table" in lowered or "markdown" in lowered or "form" in lowered:
-        return "<image>\n<|grounding|>Convert the document to markdown."
-    return "<image>\nFree OCR."
+    """Always use DeepSeek-OCR's grounding+markdown prompt.
+
+    This is the model's structured extraction mode: it preserves reading
+    order across mixed text and tables, and encodes table structure
+    (including multi-level/merged headers) via HTML colspan/rowspan in its
+    output -- which OCRService then parses precisely (see
+    _expanded_table_rows / _merge_multirow_header in ocr_service.py).
+
+    DeepSeek-OCR's "Free OCR." mode is plain unstructured text with no
+    layout/reading-order guarantees, so it's intentionally not used here
+    even though the caller's instruction_text is otherwise ignored --
+    DeepSeek-OCR only reliably follows its own fixed task prompts, not
+    free-form natural-language instructions.
+    """
+    return "<image>\n<|grounding|>Convert the document to markdown."
 
 
 @app.post("/v1/chat/completions")
@@ -237,9 +261,9 @@ async def chat_completions(request: dict) -> JSONResponse:
                 prompt=prompt,
                 image_file=image_path,
                 output_path=tmp_dir,
-                base_size=1024,
-                image_size=640,
-                crop_mode=True,
+                base_size=DEEPSEEK_BASE_SIZE,
+                image_size=DEEPSEEK_IMAGE_SIZE,
+                crop_mode=DEEPSEEK_CROP_MODE,
                 save_results=True,
             )
 
