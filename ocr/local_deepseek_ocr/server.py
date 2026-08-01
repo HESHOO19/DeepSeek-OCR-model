@@ -238,51 +238,87 @@ async def chat_completions(request: dict) -> JSONResponse:
     if not image_b64:
         return JSONResponse(status_code=400, content={"error": {"message": "No image_url found in messages."}})
 
-    image_bytes = base64.b64decode(image_b64)
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": f"Could not decode image data: {exc}"}},
+        )
+
     prompt = _build_deepseek_prompt(instruction_text)
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        image_path = os.path.join(tmp_dir, "input.png")
-        with open(image_path, "wb") as f:
-            f.write(image_bytes)
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            image_path = os.path.join(tmp_dir, "input.png")
+            with open(image_path, "wb") as f:
+                f.write(image_bytes)
 
-        # save_results MUST be True: on upstream DeepSeek-OCR, infer() only
-        # populates its return value when save_results=True (confirmed via
-        # https://github.com/deepseek-ai/DeepSeek-OCR/issues/249 -- without
-        # it, infer() effectively returns nothing usable). Setting it False
-        # to silence the console dump (as we tried before) breaks the actual
-        # OCR result, not just the noise -- that's what caused the empty
-        # json/md/txt outputs. So: keep it True, and suppress the console
-        # spam separately via redirect_stdout instead.
-        stdout_capture = io.StringIO()
-        with contextlib.redirect_stdout(stdout_capture):
-            result = _state["model"].infer(
-                _state["tokenizer"],
-                prompt=prompt,
-                image_file=image_path,
-                output_path=tmp_dir,
-                base_size=DEEPSEEK_BASE_SIZE,
-                image_size=DEEPSEEK_IMAGE_SIZE,
-                crop_mode=DEEPSEEK_CROP_MODE,
-                save_results=True,
-            )
+            # save_results MUST be True: on upstream DeepSeek-OCR, infer() only
+            # populates its return value when save_results=True (confirmed via
+            # https://github.com/deepseek-ai/DeepSeek-OCR/issues/249 -- without
+            # it, infer() effectively returns nothing usable). Setting it False
+            # to silence the console dump (as we tried before) breaks the actual
+            # OCR result, not just the noise -- that's what caused the empty
+            # json/md/txt outputs. So: keep it True, and suppress the console
+            # spam separately via redirect_stdout instead.
+            stdout_capture = io.StringIO()
+            with contextlib.redirect_stdout(stdout_capture):
+                result = _state["model"].infer(
+                    _state["tokenizer"],
+                    prompt=prompt,
+                    image_file=image_path,
+                    output_path=tmp_dir,
+                    base_size=DEEPSEEK_BASE_SIZE,
+                    image_size=DEEPSEEK_IMAGE_SIZE,
+                    crop_mode=DEEPSEEK_CROP_MODE,
+                    save_results=True,
+                )
 
-        if isinstance(result, dict):
-            text = result.get("text", "")
-        elif isinstance(result, str):
-            text = result
-        else:
-            text = str(result) if result is not None else ""
+            if isinstance(result, dict):
+                text = result.get("text", "")
+            elif isinstance(result, str):
+                text = result
+            else:
+                text = str(result) if result is not None else ""
 
-        # Fallback: some DeepSeek-OCR versions leave the return value empty
-        # even with save_results=True and only write the real text to disk.
-        # Must happen inside this `with` block -- tmp_dir is deleted on exit.
-        if not text.strip():
-            for pattern in ("*.mmd", "*.md", "*.txt"):
-                matches = sorted(Path(tmp_dir).rglob(pattern))
-                if matches:
-                    text = matches[0].read_text(encoding="utf-8", errors="ignore")
-                    break
+            # Fallback: some DeepSeek-OCR versions leave the return value empty
+            # even with save_results=True and only write the real text to disk.
+            # Must happen inside this `with` block -- tmp_dir is deleted on exit.
+            if not text.strip():
+                for pattern in ("*.mmd", "*.md", "*.txt"):
+                    matches = sorted(Path(tmp_dir).rglob(pattern))
+                    if matches:
+                        text = matches[0].read_text(encoding="utf-8", errors="ignore")
+                        break
+    except torch.cuda.OutOfMemoryError as exc:  # noqa: BLE001
+        logger.exception("CUDA out of memory during inference")
+        torch.cuda.empty_cache()
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": (
+                        f"GPU ran out of memory during inference: {exc}. "
+                        "Try a smaller image, a lower DEEPSEEK_BASE_SIZE, "
+                        "or disable crop_mode."
+                    )
+                }
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Previously unhandled: any failure here (bad image data, a model
+        # runtime error, anything) crashed out as FastAPI's generic 500 with
+        # no message body, which the OCR backend could only ever report to
+        # the user as an opaque "502 Bad Gateway" -- no way to tell what
+        # actually broke. Logging the full traceback server-side (visible in
+        # this process's console) and returning the real message is what
+        # makes that diagnosable going forward.
+        logger.exception("DeepSeek-OCR inference failed")
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": f"Inference failed: {exc}"}},
+        )
 
     return JSONResponse(
         content={

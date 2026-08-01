@@ -1130,10 +1130,19 @@ Dense document handling:
 
         except httpx.HTTPStatusError as exc:
             logger.error("VL model API returned %s: %s", exc.response.status_code, exc.response.text)
+            detail = ""
+            try:
+                body = exc.response.json()
+                detail = str(body.get("error", {}).get("message", "")) if isinstance(body, dict) else ""
+            except (ValueError, AttributeError):
+                pass
+            message = f"Model API returned HTTP {exc.response.status_code}"
+            if detail:
+                message += f": {detail}"
             return {
                 "success": False,
                 "text": None,
-                "error": f"Model API returned HTTP {exc.response.status_code}",
+                "error": message,
             }
         except httpx.RequestError as exc:
             logger.error("Request to VL model failed: %s", exc)
