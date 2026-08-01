@@ -327,17 +327,31 @@ Dense document handling:
         every column after it.
 
         Merged-cell text is duplicated into every cell it visually spans
-        (not just the top-left one) rather than left blank, so a header
-        like "Gland Dimensions" spanning 6 sub-columns keeps that context
-        on all 6, not just the first -- this is what lets
-        _merge_multirow_header build a full per-column title afterward.
+        (not just the top-left one) rather than left blank -- but only
+        for header cells (<th>), so a header like "Gland Dimensions"
+        spanning 6 sub-columns keeps that context on all 6, not just the
+        first; this is what lets _merge_multirow_header build a full
+        per-column title afterward. Data cells (<td>) instead keep their
+        text in the leading column only and leave the columns they merely
+        span blank, matching how a merged cell actually renders -- the
+        previous version duplicated data-cell text the same way as
+        headers, so any row with a merged data/note cell came out with
+        that same value repeated across every column it spanned, which
+        reads as duplicated columns in the exported table.
+
+        Tables that never use <th> at all (some OCR output is <td>-only,
+        even for what is visually the header row) fall back to treating
+        just the first row as the "header" row for duplication purposes,
+        since a single leading header row is by far the most common case.
         """
+        any_header_cells = any(cell.get("header") for row in table for cell in row)
+
         grid: list[list[str]] = []
         # col_index -> (text, rows_remaining) for cells still being carried
         # down from an earlier row's rowspan.
         pending: dict[int, tuple[str, int]] = {}
 
-        for row in table:
+        for row_idx, row in enumerate(table):
             expanded_row: list[str] = []
             col_idx = 0
             cell_iter = iter(row)
@@ -358,10 +372,12 @@ Dense document handling:
                 colspan = max(1, int(cell.get("colspan", 1)))
                 rowspan = max(1, int(cell.get("rowspan", 1)))
                 text = str(cell.get("text", ""))
+                is_header_cell = cell.get("header", False) if any_header_cells else row_idx == 0
                 for offset in range(colspan):
-                    expanded_row.append(text)
+                    cell_text = text if (offset == 0 or is_header_cell) else ""
+                    expanded_row.append(cell_text)
                     if rowspan > 1:
-                        pending[col_idx + offset] = (text, rowspan - 1)
+                        pending[col_idx + offset] = (cell_text, rowspan - 1)
                 col_idx += colspan
                 cell = next(cell_iter, None)
 
