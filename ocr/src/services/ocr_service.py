@@ -1145,11 +1145,12 @@ Dense document handling:
                 "error": message,
             }
         except httpx.RequestError as exc:
-            logger.error("Request to VL model failed: %s", exc)
+            logger.error("Request to VL model failed: %s: %s", type(exc).__name__, exc)
+            detail = str(exc) or "no further detail from httpx"
             return {
                 "success": False,
                 "text": None,
-                "error": f"Request failed: {exc}",
+                "error": f"Request failed ({type(exc).__name__}): {detail}",
             }
         except (KeyError, IndexError, json.JSONDecodeError) as exc:
             logger.error("Unexpected VL model response structure: %s", exc)
