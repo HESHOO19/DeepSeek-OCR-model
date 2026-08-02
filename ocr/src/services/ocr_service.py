@@ -311,8 +311,6 @@ Dense document handling:
         parser.close()
         return parser.blocks
 
-    _NUMERIC_CELL_RE = re.compile(r"^[+-]?\d[\d,]*(\.\d+)?%?$")
-
     @staticmethod
     def _expanded_table_rows(table: list[list[dict[str, Any]]]) -> list[list[str]]:
         """Expand an HTML table into a full rectangular grid of plain
@@ -390,19 +388,19 @@ Dense document handling:
             for row in table[: min(4, len(table))]
             for cell in row
         )
-        return OCRService._merge_multirow_header(grid, has_span_structure)
-
-    @classmethod
-    def _looks_like_header_row(cls, row: list[str]) -> bool:
-        non_empty = [cell for cell in row if cell.strip()]
-        if not non_empty:
-            return True  # blank spacer row inside a header block
-        numeric = sum(1 for cell in non_empty if cls._NUMERIC_CELL_RE.match(cell.strip()))
-        return (numeric / len(non_empty)) < 0.5
+        structural_header_rows = (
+            [bool(row) and all(cell.get("header") for cell in row) for row in table]
+            if any_header_cells
+            else None
+        )
+        return OCRService._merge_multirow_header(grid, has_span_structure, structural_header_rows)
 
     @classmethod
     def _merge_multirow_header(
-        cls, rows: list[list[str]], has_span_structure: bool
+        cls,
+        rows: list[list[str]],
+        has_span_structure: bool,
+        structural_header_rows: list[bool] | None = None,
     ) -> list[list[str]]:
         """Collapse a multi-row header block (parent header + sub-column
         headers) into a single composite header row, so every leaf column
@@ -410,21 +408,37 @@ Dense document handling:
         Across flat" instead of just the bottom-most, ambiguous label.
 
         Gated on `has_span_structure` (whether the source table actually
-        used colspan/rowspan near the top) before even attempting
-        content-based header detection -- this is deliberate: guessing
-        "header-like" purely from cell content (mostly non-numeric text)
-        produces false positives on completely ordinary tables whose data
-        rows just happen to be text-heavy (e.g. Name/Age/City), merging
-        the real header into the first data row. Requiring actual span
-        structure first means this only ever fires on tables that are
+        used colspan/rowspan near the top) before even attempting to find
+        a header block at all -- this is deliberate: any header-detection
+        approach risks false positives on completely ordinary tables whose
+        data rows just happen to be text-heavy, merging real data into a
+        composite header and silently destroying rows. Requiring actual
+        span structure first means this only ever fires on tables that are
         genuinely nested.
+
+        Prefers `structural_header_rows` (whether each row's cells were
+        actually tagged <th> by the source) to identify the header block --
+        that's a fact about what the model emitted, not a guess. When the
+        table has no <th> tags at all, this does NOT attempt multi-row
+        header merging -- an earlier version guessed from content (mostly
+        non-numeric cells), but that guess had no reliable way to tell a
+        real header row apart from an ordinary text-heavy data row (part
+        numbers, descriptions, standards, etc. -- exactly what a spec-sheet
+        table is made of). On a table where several data rows in a row
+        happened to look "header-like", it walked through and merged every
+        one of them into a single composite cell, jamming unrelated rows'
+        text together and losing the rest -- this is what caused
+        correctly-extracted tables to come out nearly empty after a table
+        with even one small rowspan/colspan. Preserving every row
+        correctly is worth more than a nicer composite header on the rare
+        table that never uses <th>.
         """
-        if not has_span_structure or len(rows) < 3:
+        if not has_span_structure or len(rows) < 3 or structural_header_rows is None:
             return rows
 
         header_row_count = 0
-        for row in rows[:-1]:
-            if cls._looks_like_header_row(row):
+        for is_header in structural_header_rows[:-1]:
+            if is_header:
                 header_row_count += 1
             else:
                 break
