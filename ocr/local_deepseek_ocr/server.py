@@ -58,6 +58,28 @@ DEEPSEEK_CROP_MODE = os.environ.get("DEEPSEEK_CROP_MODE", "true").strip().lower(
     "no",
 )
 
+# Decoding overrides. DeepSeek-OCR's own infer() hardcodes
+# no_repeat_ngram_size=20 (35 in eval_mode) and never exposes
+# repetition_penalty or num_beams as arguments at all -- there is no
+# supported way to change decoding through infer()'s public signature.
+# no_repeat_ngram_size=20 in particular is a hard "never repeat this exact
+# 20-token sequence again" constraint, which is the wrong tool for
+# multi-column tables with a shared/common header: repeated <td> boilerplate
+# and repeated short cell values legitimately recur row after row and can
+# span a 20-token window, so the model gets forced off the correct token
+# and the row silently stops matching the header. Raising this well above
+# the length of a typical repeated row segment (default here: 100) lets
+# short legitimate repeats survive while it still catches genuine runaway
+# repetition loops. repetition_penalty is a logits processor that applies
+# during greedy decoding too (unlike temperature/top_p/top_k, which only do
+# anything once do_sample=True), so it's a real lever even though decoding
+# stays greedy. num_beams>1 trades speed/VRAM for generally more accurate
+# structured/tabular output than pure greedy; left at 1 (off) by default
+# since it roughly multiplies inference cost by the beam count.
+DEEPSEEK_NO_REPEAT_NGRAM = int(os.environ.get("DEEPSEEK_NO_REPEAT_NGRAM", "100"))
+DEEPSEEK_REPETITION_PENALTY = float(os.environ.get("DEEPSEEK_REPETITION_PENALTY", "1.05"))
+DEEPSEEK_NUM_BEAMS = int(os.environ.get("DEEPSEEK_NUM_BEAMS", "1"))
+
 app = FastAPI(title="DeepSeek-OCR Local Server")
 
 _state: dict = {"status": "loading", "model": None, "tokenizer": None, "error": None}
@@ -67,6 +89,38 @@ def _gpu_vram_gb() -> float:
     if not torch.cuda.is_available():
         return 0.0
     return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+
+
+def _patch_generation_overrides(model) -> None:
+    """Wrap model.generate so DEEPSEEK_NO_REPEAT_NGRAM /
+    DEEPSEEK_REPETITION_PENALTY / DEEPSEEK_NUM_BEAMS actually reach decoding.
+
+    infer() calls self.generate(..., no_repeat_ngram_size=20, ...) with that
+    value hardcoded in the model's own source -- there's no parameter on
+    infer() to change it. Rather than hand-patching the HF cache copy of
+    modeling_deepseekocr.py (which breaks the moment the model is
+    re-downloaded or updated), we wrap the bound generate() method here: any
+    call arriving through infer() gets these specific kwargs overridden
+    right before they reach the real generate(), and everything else infer()
+    does is untouched. This lives entirely in our own code, so it survives
+    model re-downloads and version bumps.
+    """
+    original_generate = model.generate
+
+    def _patched_generate(*args, **kwargs):
+        kwargs["no_repeat_ngram_size"] = DEEPSEEK_NO_REPEAT_NGRAM
+        kwargs["repetition_penalty"] = DEEPSEEK_REPETITION_PENALTY
+        if DEEPSEEK_NUM_BEAMS > 1:
+            kwargs["num_beams"] = DEEPSEEK_NUM_BEAMS
+        return original_generate(*args, **kwargs)
+
+    model.generate = _patched_generate
+    logger.info(
+        "Patched generate() overrides: no_repeat_ngram_size=%d, repetition_penalty=%.3f, num_beams=%d",
+        DEEPSEEK_NO_REPEAT_NGRAM,
+        DEEPSEEK_REPETITION_PENALTY,
+        DEEPSEEK_NUM_BEAMS,
+    )
 
 
 def _load_model() -> None:
@@ -94,7 +148,7 @@ def _load_model() -> None:
 
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
@@ -111,7 +165,7 @@ def _load_model() -> None:
                         use_safetensors=True,
                         quantization_config=quant_config,
                         device_map={"": 0},
-                        torch_dtype=torch.float16,
+                        torch_dtype=torch.bfloat16,
                     )
                     logger.info("Loaded 4-bit with %s attention.", attn_impl)
                     break
@@ -165,7 +219,9 @@ def _load_model() -> None:
                 raise RuntimeError(
                     "Could not load DeepSeek-OCR with either flash_attention_2 or eager attention."
                 )
-            model = model.eval().cuda().half()
+            model = model.eval().cuda().to(torch.bfloat16)
+
+        _patch_generation_overrides(model)
 
         _state["tokenizer"] = tokenizer
         _state["model"] = model

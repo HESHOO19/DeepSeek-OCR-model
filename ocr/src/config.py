@@ -1,4 +1,19 @@
-"""Application settings for the OCR service."""
+"""Application settings for the OCR service.
+
+NOTE on generation_params below: these values are not read by
+local_deepseek_ocr/server.py. DeepSeek-OCR's own infer() method doesn't
+accept temperature/top_p/top_k/repetition_penalty as arguments at all (its
+signature is tokenizer, prompt, image_file, output_path, base_size,
+image_size, crop_mode, test_compress, save_results, eval_mode only), so this
+dict was never actually reaching the model regardless of what's set here or
+in the request payload -- confirmed against the real source of
+modeling_deepseekocr.py. The knobs that do reach decoding for the local
+server live in local_deepseek_ocr/server.py as DEEPSEEK_NO_REPEAT_NGRAM /
+DEEPSEEK_REPETITION_PENALTY / DEEPSEEK_NUM_BEAMS env vars instead, via a
+generate() wrapper there. This dict is kept here only in case OCR_API_URL is
+pointed at a real OpenAI-compatible / vLLM endpoint instead of the local
+server, where these fields are meaningful.
+"""
 
 from __future__ import annotations
 
